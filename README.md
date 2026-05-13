@@ -36,6 +36,10 @@ Copy `TeamsOBSAutoRecord.app` to your `/Applications` folder.
 3. When you join a Teams meeting, OBS will automatically launch and start recording
 4. When you leave the meeting, recording stops and OBS closes automatically
 
+## Developer Documentation
+
+See `ForAnotherLLM.md` for implementation details, troubleshooting, and how to run without the app bundle.
+
 ## Building the App (if needed)
 
 The app bundle structure:
