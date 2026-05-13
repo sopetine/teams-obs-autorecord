@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.teams-obs-autorecord</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/Evgenii_Sopetin/Documents/MiniMax/Ad-hock/teams_obs_autorecord.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/teams-obs-autorecord.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/teams-obs-autorecord.error.log</string>
+</dict>
+</plist>
