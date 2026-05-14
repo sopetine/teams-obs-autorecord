@@ -9,6 +9,7 @@ import subprocess
 import time
 import json
 import os
+import fcntl
 import struct
 import base64
 import socket
@@ -22,8 +23,23 @@ RECORDINGS_DIR = Path.home() / "Movies" / "OBS"
 MEETING_STATUS_FILE = Path.home() / ".teams-obs-meeting.json"   # written by StatusApp (Swift)
 OBS_STATUS_FILE = Path.home() / ".teams-obs-status.json"        # written here, read by StatusApp for UI
 LOG_FILE = Path.home() / ".teams-obs-log.txt"
+LOCK_FILE = Path.home() / ".teams-obs-autorecord.lock"
 
 POLL_INTERVAL = 2
+
+# ── Single-instance lock ───────────────────────────────────────────────────────
+
+def acquire_lock():
+    """Exit immediately if another instance is already running."""
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Another instance already running. Exiting.")
+        raise SystemExit(0)
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+    return lock_fd  # keep fd open to hold the lock
 
 
 def log(msg):
@@ -232,6 +248,7 @@ def quit_obs():
 
 
 def main():
+    lock_fd = acquire_lock()  # exit immediately if already running
     log("=" * 50)
     log("OBS Auto-Record (OBS controller)")
     log("=" * 50)

@@ -1,72 +1,250 @@
 import Cocoa
-import Foundation
+import ApplicationServices
 
-// Status written to disk for the Python OBS controller to read
-struct MeetingStatus: Codable {
-    var inMeeting: Bool
-    var meetingName: String
-    var timestamp: String
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+let MEETING_STATUS_FILE = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".teams-obs-meeting.json")
+let OBS_STATUS_FILE = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".teams-obs-status.json")
+let SWIFT_LOG_FILE = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".teams-obs-swift.log")
+let RECORDINGS_DIR = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Movies/OBS")
+
+func swiftLog(_ msg: String) {
+    let fmt = DateFormatter()
+    fmt.dateFormat = "HH:mm:ss"
+    let line = "[\(fmt.string(from: Date()))] \(msg)\n"
+    guard let data = line.data(using: .utf8) else { return }
+    if let fh = try? FileHandle(forWritingTo: SWIFT_LOG_FILE) {
+        fh.seekToEndOfFile()
+        fh.write(data)
+        try? fh.close()
+    } else {
+        try? data.write(to: SWIFT_LOG_FILE)
+    }
 }
 
-let statusFile = URL(fileURLWithPath: NSHomeDirectory() + "/.teams-obs-meeting.json")
-let obsStatusFile = URL(fileURLWithPath: NSHomeDirectory() + "/.teams-obs-status.json")
+// ── Recording model ───────────────────────────────────────────────────────────
 
-// MARK: - Status Window
+struct Recording {
+    let url: URL
+    let name: String
+    let size: Int64
+    let modDate: Date
+
+    var formattedSize: String {
+        let mb = Double(size) / 1_048_576
+        if mb >= 1000 { return String(format: "%.1f GB", mb / 1024) }
+        return String(format: "%.1f MB", mb)
+    }
+}
+
+// ── Recordings Table ──────────────────────────────────────────────────────────
+
+class RecordingsDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    var recordings: [Recording] = []
+    weak var tableView: NSTableView?
+
+    func reload() {
+        recordings = loadRecordings()
+        tableView?.reloadData()
+    }
+
+    private func loadRecordings() -> [Recording] {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: RECORDINGS_DIR,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        return items
+            .filter { ["mp4", "mkv", "mov"].contains($0.pathExtension.lowercased()) }
+            .compactMap { url -> Recording? in
+                guard
+                    let res = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                    let size = res.fileSize,
+                    let mod = res.contentModificationDate
+                else { return nil }
+                return Recording(url: url, name: url.lastPathComponent, size: Int64(size), modDate: mod)
+            }
+            .sorted { $0.modDate > $1.modDate }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { recordings.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let rec = recordings[row]
+        switch tableColumn?.identifier.rawValue {
+        case "name":
+            let cell = NSTextField(labelWithString: rec.name)
+            cell.font = .systemFont(ofSize: 12)
+            cell.textColor = .labelColor
+            cell.lineBreakMode = .byTruncatingMiddle
+            return cell
+        case "size":
+            let cell = NSTextField(labelWithString: rec.formattedSize)
+            cell.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            cell.textColor = .secondaryLabelColor
+            cell.alignment = .right
+            return cell
+        case "play":
+            let btn = NSButton(title: "▶ Play", target: self, action: #selector(playClicked(_:)))
+            btn.bezelStyle = .rounded
+            btn.font = .systemFont(ofSize: 11)
+            btn.tag = row
+            return btn
+        default:
+            return nil
+        }
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 26 }
+
+    @objc func playClicked(_ sender: NSButton) {
+        let row = sender.tag
+        guard row < recordings.count else { return }
+        NSWorkspace.shared.open(recordings[row].url)
+    }
+}
+
+// ── Status Window ─────────────────────────────────────────────────────────────
 
 class StatusWindowController: NSWindowController {
     private var statusLabel: NSTextField!
     private var meetingLabel: NSTextField!
-    private var pollTimer: Timer?
+    private var recordingsDataSource = RecordingsDataSource()
+    private var tableView: NSTableView!
+    private var timer: Timer?
 
-    init() {
+    convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Teams OBS Auto-Record"
         window.center()
-        window.isReleasedWhenClosed = false
-        super.init(window: window)
-        setupUI()
-        startPolling()
+        window.setFrameAutosaveName("StatusWindow")
+        self.init(window: window)
+        buildUI()
     }
 
-    required init?(coder: NSCoder) { fatalError() }
-
-    private func setupUI() {
+    private func buildUI() {
         guard let cv = window?.contentView else { return }
 
         statusLabel = NSTextField(labelWithString: "Status: Starting...")
-        statusLabel.frame = NSRect(x: 20, y: 70, width: 280, height: 24)
-        statusLabel.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        statusLabel.font = .systemFont(ofSize: 14, weight: .medium)
         statusLabel.textColor = .systemGray
-        statusLabel.alignment = .center
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
         cv.addSubview(statusLabel)
 
         meetingLabel = NSTextField(labelWithString: "Meeting: None")
-        meetingLabel.frame = NSRect(x: 20, y: 40, width: 280, height: 24)
-        meetingLabel.font = NSFont.systemFont(ofSize: 12)
+        meetingLabel.font = .systemFont(ofSize: 13)
         meetingLabel.textColor = .secondaryLabelColor
-        meetingLabel.alignment = .center
+        meetingLabel.translatesAutoresizingMaskIntoConstraints = false
         cv.addSubview(meetingLabel)
 
-        let quitButton = NSButton(title: "Quit", target: self, action: #selector(quitApp))
-        quitButton.frame = NSRect(x: 120, y: 10, width: 80, height: 24)
-        quitButton.bezelStyle = .rounded
-        cv.addSubview(quitButton)
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(divider)
+
+        let recHeader = NSTextField(labelWithString: "Recordings")
+        recHeader.font = .systemFont(ofSize: 12, weight: .semibold)
+        recHeader.textColor = .secondaryLabelColor
+        recHeader.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(recHeader)
+
+        tableView = NSTableView()
+        if #available(macOS 11.0, *) { tableView.style = .plain }
+        tableView.rowHeight = 26
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        tableView.allowsColumnReordering = false
+        tableView.allowsColumnResizing = true
+        tableView.doubleAction = #selector(tableDoubleClicked)
+        tableView.target = self
+
+        let nameCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
+        nameCol.title = "Name"
+        nameCol.minWidth = 200
+        nameCol.width = 320
+        tableView.addTableColumn(nameCol)
+
+        let sizeCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
+        sizeCol.title = "Size"
+        sizeCol.minWidth = 60
+        sizeCol.width = 80
+        sizeCol.resizingMask = .userResizingMask
+        tableView.addTableColumn(sizeCol)
+
+        let playCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("play"))
+        playCol.title = ""
+        playCol.minWidth = 70
+        playCol.width = 70
+        playCol.maxWidth = 70
+        playCol.resizingMask = []
+        tableView.addTableColumn(playCol)
+
+        recordingsDataSource.tableView = tableView
+        tableView.dataSource = recordingsDataSource
+        tableView.delegate = recordingsDataSource
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = tableView
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .bezelBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(scrollView)
+
+        let quitBtn = NSButton(title: "Quit", target: self, action: #selector(quitApp))
+        quitBtn.bezelStyle = .rounded
+        quitBtn.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(quitBtn)
+
+        NSLayoutConstraint.activate([
+            statusLabel.topAnchor.constraint(equalTo: cv.topAnchor, constant: 16),
+            statusLabel.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 16),
+            statusLabel.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -16),
+
+            meetingLabel.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 6),
+            meetingLabel.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 16),
+            meetingLabel.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -16),
+
+            divider.topAnchor.constraint(equalTo: meetingLabel.bottomAnchor, constant: 12),
+            divider.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 16),
+            divider.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -16),
+
+            recHeader.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 10),
+            recHeader.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 16),
+
+            scrollView.topAnchor.constraint(equalTo: recHeader.bottomAnchor, constant: 6),
+            scrollView.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 16),
+            scrollView.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -16),
+            scrollView.bottomAnchor.constraint(equalTo: quitBtn.topAnchor, constant: -12),
+
+            quitBtn.bottomAnchor.constraint(equalTo: cv.bottomAnchor, constant: -16),
+            quitBtn.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -16),
+        ])
     }
 
-    private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.updateStatus()
-        }
+    func startPolling() {
         updateStatus()
+        recordingsDataSource.reload()
+        timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            self?.updateStatus()
+            self?.recordingsDataSource.reload()
+        }
     }
 
-    func updateStatus() {
-        guard let data = try? Data(contentsOf: obsStatusFile),
+    private func updateStatus() {
+        guard let data = try? Data(contentsOf: OBS_STATUS_FILE),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             statusLabel.stringValue = "Status: Starting..."
             statusLabel.textColor = .systemGray
@@ -75,189 +253,144 @@ class StatusWindowController: NSWindowController {
         }
         let recording = json["recording"] as? Bool ?? false
         let inMeeting = json["in_meeting"] as? Bool ?? false
-        let name = json["meeting"] as? String ?? "None"
-
+        let meeting = json["meeting"] as? String ?? "None"
         if recording {
             statusLabel.stringValue = "Status: Recording"
-            statusLabel.textColor = .systemRed
-            meetingLabel.stringValue = "Meeting: \(name)"
-            meetingLabel.textColor = .labelColor
+            statusLabel.textColor = .systemGreen
         } else if inMeeting {
             statusLabel.stringValue = "Status: Starting recording..."
             statusLabel.textColor = .systemOrange
-            meetingLabel.stringValue = "Meeting: \(name)"
-            meetingLabel.textColor = .labelColor
         } else {
             statusLabel.stringValue = "Status: Monitoring Teams..."
-            statusLabel.textColor = .systemGreen
-            meetingLabel.stringValue = "Meeting: None"
-            meetingLabel.textColor = .secondaryLabelColor
+            statusLabel.textColor = .systemGray
         }
+        meetingLabel.stringValue = "Meeting: \(meeting)"
     }
 
-    @objc private func quitApp() {
-        // Kill Python OBS controller
-        let kill = Process()
-        kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        kill.arguments = ["-f", "teams_obs_autorecord"]
-        try? kill.run()
-        NSApplication.shared.terminate(nil)
+    @objc private func tableDoubleClicked() {
+        let row = tableView.clickedRow
+        guard row >= 0, row < recordingsDataSource.recordings.count else { return }
+        NSWorkspace.shared.open(recordingsDataSource.recordings[row].url)
     }
+
+    @objc func quitApp() { NSApplication.shared.terminate(nil) }
 }
 
-// MARK: - Meeting Detector (runs in Swift, has Accessibility permission)
+// ── Meeting Detector ──────────────────────────────────────────────────────────
 
 class MeetingDetector {
     private var timer: Timer?
-    private let encoder = JSONEncoder()
-    private var lastStatus: Bool? = nil
 
     func start() {
-        let trusted = AXIsProcessTrusted()
-        appendLog("AXIsProcessTrusted=\(trusted)")
-        if !trusted {
-            // Prompt with explanation
-            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-            AXIsProcessTrustedWithOptions(opts)
-
-            // Show dialog guiding user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "Please add TeamsOBSAutoRecord to System Settings → Privacy & Security → Accessibility, then restart the app."
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Later")
-                if alert.runModal() == .alertFirstButtonReturn {
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        }
-
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.detect()
+            self?.detectMeeting()
         }
-        detect()
+        detectMeeting()
     }
 
-    private func detect() {
-        appendLog("detect() called")
-        // Use AX API directly - works without subprocess, no osascript permission issues
-        let apps = NSWorkspace.shared.runningApplications
-        appendLog("runningApplications count=\(apps.count)")
-        let teamsApps = apps.filter { $0.bundleIdentifier?.contains("teams") == true }
-        appendLog("teams apps: \(teamsApps.map { "\($0.bundleIdentifier ?? "nil")" })")
-        guard let teams = apps.first(where: {
-            $0.bundleIdentifier == "com.microsoft.teams2"
-        }) else {
-            writeMeetingStatus(inMeeting: false, name: "")
-            return
-        }
-
-        let axApp = AXUIElementCreateApplication(teams.processIdentifier)
-        var windowsRef: CFTypeRef?
-        let axResult = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
-        appendLog("AX result=\(axResult.rawValue) windowsRef=\(windowsRef != nil ? "non-nil" : "nil")")
-        guard axResult == .success, let windows = windowsRef as? [AXUIElement] else {
-            writeMeetingStatus(inMeeting: false, name: "")
-            return
-        }
-
-        var titles: [String] = []
-        for win in windows {
-            var titleRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef) == .success,
-               let title = titleRef as? String, !title.isEmpty {
-                titles.append(title)
-            }
-        }
-
-        appendLog("Found \(titles.count) windows: \(titles.map { String($0.prefix(40)) })")
-
-        var meetingName: String? = nil
-        for title in titles {
-            if title.hasPrefix("Meeting compact view |") {
-                meetingName = extractName(from: title)
-                appendLog("Matched: \(title.prefix(60))")
-                break
-            }
-            if title.hasPrefix("Stand-up |") || title.hasPrefix("Chat |") || title.hasPrefix("Call |") {
-                continue
-            }
-            let parts = title.components(separatedBy: "|")
-            if parts.first?.trimmingCharacters(in: CharacterSet.whitespaces) == "Meeting" {
-                meetingName = extractName(from: title)
-                appendLog("Matched (keyword): \(title.prefix(60))")
-                break
-            }
-        }
-
-        writeMeetingStatus(inMeeting: meetingName != nil, name: meetingName ?? "")
+    func stop() {
+        timer?.invalidate()
+        timer = nil
     }
 
-    private func appendLog(_ msg: String) {
-        let logFile = URL(fileURLWithPath: NSHomeDirectory() + "/.teams-obs-swift.log")
-        let line = "[\(Date())] \(msg)\n"
-        if let data = line.data(using: .utf8) {
-            if let handle = try? FileHandle(forWritingTo: logFile) {
-                handle.seekToEndOfFile()
-                handle.write(data)
-                handle.closeFile()
-            } else {
-                try? data.write(to: logFile)
-            }
-        }
+    private func isMeetingWindow(_ title: String) -> Bool {
+        // Skip pure sidebar/chat windows (not meetings)
+        let nonMeetingPrefixes = ["Chat |"]
+        if nonMeetingPrefixes.contains(where: { title.hasPrefix($0) }) { return false }
+
+        // Definitely a meeting
+        if title.hasPrefix("Meeting compact view |") { return true }
+        if title.hasPrefix("Call |") { return true }
+
+        // Any window ending with "| Microsoft Teams" that isn't a chat
+        if title.hasSuffix("| Microsoft Teams") { return true }
+
+        return false
     }
 
-    private func extractName(from title: String) -> String {
+    private func extractMeetingName(_ title: String) -> String {
         var name = title
+        // Remove "Meeting compact view | " prefix
         if name.hasPrefix("Meeting compact view | ") {
             name = String(name.dropFirst("Meeting compact view | ".count))
         }
-        let parts = name.components(separatedBy: "|")
+        // Take first segment before " | "
+        let parts = name.components(separatedBy: " | ")
         return parts.first?.trimmingCharacters(in: .whitespaces) ?? name
     }
 
-    private func writeMeetingStatus(inMeeting: Bool, name: String) {
-        let dict: [String: Any] = [
-            "in_meeting": inMeeting,
-            "meeting_name": name,
-            "timestamp": ISO8601DateFormatter().string(from: Date())
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted) {
-            try? data.write(to: statusFile)
+    private func detectMeeting() {
+        var inMeeting = false
+        var meetingName = ""
+
+        let teamsApps = NSWorkspace.shared.runningApplications
+            .filter { $0.bundleIdentifier == "com.microsoft.teams2" }
+
+        for app in teamsApps {
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var windowsVal: CFTypeRef?
+            let axResult = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsVal)
+
+            if axResult.rawValue == -25211 {
+                swiftLog("AX error -25211: not trusted. Stopping detector.")
+                stop()
+                DispatchQueue.main.async {
+                    AppDelegate.shared?.showAXResetAlert()
+                }
+                return
+            }
+
+            guard axResult == .success, let windows = windowsVal as? [AXUIElement] else { continue }
+
+            swiftLog("Windows: \(windows.count)")
+            for win in windows {
+                var titleVal: CFTypeRef?
+                guard AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleVal) == .success,
+                      let title = titleVal as? String, !title.isEmpty else { continue }
+
+                swiftLog("  Window: \(title.prefix(60))")
+                if isMeetingWindow(title) {
+                    inMeeting = true
+                    meetingName = extractMeetingName(title)
+                    swiftLog("  -> MEETING: \(meetingName)")
+                    break
+                }
+            }
+            if inMeeting { break }
+        }
+
+        let result: [String: Any] = ["in_meeting": inMeeting, "meeting_name": meetingName]
+        if let data = try? JSONSerialization.data(withJSONObject: result) {
+            try? data.write(to: MEETING_STATUS_FILE)
         }
     }
 }
 
-// MARK: - App Delegate
+// ── App Delegate ──────────────────────────────────────────────────────────────
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var windowController: StatusWindowController?
-    var detector = MeetingDetector()
+    // Weak-ref singleton so MeetingDetector can reach back without a retain cycle
+    static weak var shared: AppDelegate?
+
+    var windowController: StatusWindowController!
+    let meetingDetector = MeetingDetector()
     var pythonTask: Process?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
         windowController = StatusWindowController()
-        windowController?.showWindow(nil)
-        windowController?.window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        windowController.showWindow(nil)
+        windowController.startPolling()
 
-        // Start meeting detection in Swift (has Accessibility permission)
-        detector.start()
+        // Check AX trust before starting detector
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
+        if AXIsProcessTrustedWithOptions(opts) {
+            meetingDetector.start()
+        } else {
+            showAXResetAlert()
+        }
 
-        // Launch Python OBS controller (reads meeting status, controls OBS)
-        let bundlePath = Bundle.main.bundlePath + "/Contents/MacOS"
-        let venv = bundlePath + "/venv/bin/python3"
-        let script = bundlePath + "/teams_obs_autorecord.py"
-
-        pythonTask = Process()
-        pythonTask?.executableURL = URL(fileURLWithPath: venv)
-        pythonTask?.arguments = [script]
-        pythonTask?.currentDirectoryURL = URL(fileURLWithPath: bundlePath)
-        pythonTask?.environment = ["PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
-                                   "HOME": NSHomeDirectory()]
-        try? pythonTask?.run()
+        launchPython()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -265,7 +398,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         pythonTask?.terminate()
     }
+
+    func showAXResetAlert() {
+        let alert = NSAlert()
+        alert.messageText = "Accessibility Permission Required"
+        alert.informativeText = "TeamsOBSAutoRecord needs Accessibility access to detect Teams meetings.\n\nIn System Settings → Privacy & Security → Accessibility:\n• Remove the existing TeamsOBSAutoRecord entry (if present)\n• Click + and add it again\n\nThen quit and relaunch the app."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Quit App")
+        alert.addButton(withTitle: "Later")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        } else if response == .alertSecondButtonReturn {
+            NSApplication.shared.terminate(nil)
+        }
+    }
+
+    private func launchPython() {
+        // Guard: don't launch if already running
+        if let task = pythonTask, task.isRunning { return }
+
+        // Derive macOS dir from the executable path (more reliable than Bundle.main)
+        let execURL = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        let macOSDir = execURL.deletingLastPathComponent()
+        let pythonPath = macOSDir.appendingPathComponent("venv/bin/python3").path
+        let scriptPath = macOSDir.appendingPathComponent("teams_obs_autorecord.py").path
+
+        guard FileManager.default.fileExists(atPath: pythonPath),
+              FileManager.default.fileExists(atPath: scriptPath) else {
+            swiftLog("Python or script not found at \(macOSDir.path)")
+            return
+        }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: pythonPath)
+        task.arguments = [scriptPath]
+        task.environment = [
+            "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+        ]
+        task.currentDirectoryURL = macOSDir
+        task.launch()
+        pythonTask = task
+        swiftLog("Python launched (pid \(task.processIdentifier))")
+    }
 }
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
