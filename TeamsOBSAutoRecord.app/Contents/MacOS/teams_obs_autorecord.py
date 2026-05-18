@@ -260,12 +260,15 @@ def main():
     obs_launched = False
     is_recording = False
     current_meeting = None
+    meeting_end_polls = 0          # consecutive polls with in_meeting=false
+    MEETING_END_THRESHOLD = 15     # 15 × 2s = 30s grace period before stopping
 
     try:
         while True:
             in_meeting, meeting_name = read_meeting_status()
 
             if in_meeting and not is_recording:
+                meeting_end_polls = 0  # reset grace counter
                 log(f"Meeting detected: {meeting_name}")
                 write_obs_status(in_meeting=True, meeting=meeting_name)
                 current_meeting = meeting_name
@@ -289,21 +292,29 @@ def main():
                     obs = None
                     obs_launched = False
 
+            elif in_meeting and is_recording:
+                meeting_end_polls = 0  # still in meeting, reset counter
+
             elif not in_meeting and is_recording:
-                log("Meeting ended, stopping recording...")
-                write_obs_status(in_meeting=False, meeting=current_meeting or "")
-                if obs and obs.ws:
-                    obs.toggle_record()
-                    obs.close()
-                time.sleep(2)
-                rename_recording(current_meeting)
-                if obs_launched:
-                    quit_obs()
-                obs = None
-                obs_launched = False
-                is_recording = False
-                current_meeting = None
-                write_obs_status(recording=False, in_meeting=False)
+                meeting_end_polls += 1
+                if meeting_end_polls < MEETING_END_THRESHOLD:
+                    log(f"Meeting not detected ({meeting_end_polls}/{MEETING_END_THRESHOLD}), waiting...")
+                else:
+                    log("Meeting ended, stopping recording...")
+                    meeting_end_polls = 0
+                    write_obs_status(in_meeting=False, meeting=current_meeting or "")
+                    if obs and obs.ws:
+                        obs.toggle_record()
+                        obs.close()
+                    time.sleep(2)
+                    rename_recording(current_meeting)
+                    if obs_launched:
+                        quit_obs()
+                    obs = None
+                    obs_launched = False
+                    is_recording = False
+                    current_meeting = None
+                    write_obs_status(recording=False, in_meeting=False)
 
             time.sleep(POLL_INTERVAL)
 

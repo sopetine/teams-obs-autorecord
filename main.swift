@@ -294,15 +294,20 @@ class MeetingDetector {
     }
 
     private func isMeetingWindow(_ title: String) -> Bool {
-        // Skip pure sidebar/chat windows (not meetings)
-        let nonMeetingPrefixes = ["Chat |"]
+        // Explicit non-meeting prefixes — Teams navigation/activity views
+        let nonMeetingPrefixes = [
+            "Chat |", "Activity |", "Calendar |",
+            "Teams and Channels |", "Calls |", "Files |", "Apps |",
+            "Sharing Indicator", "Sharing control bar |"
+        ]
         if nonMeetingPrefixes.contains(where: { title.hasPrefix($0) }) { return false }
 
         // Definitely a meeting
         if title.hasPrefix("Meeting compact view |") { return true }
         if title.hasPrefix("Call |") { return true }
 
-        // Any window ending with "| Microsoft Teams" that isn't a chat
+        // Any other window ending with "| Microsoft Teams" is a meeting
+        // (channel meetings, direct calls, etc.)
         if title.hasSuffix("| Microsoft Teams") { return true }
 
         return false
